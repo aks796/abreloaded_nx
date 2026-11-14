@@ -74,7 +74,13 @@ int read_config(const char *file) {
       if (*tmp != 0) {
         *tmp = 0;
         for (value = tmp + 1; *value && isspace((int)*value); ++value);
-        for (tmp = value + strlen(value) - 1; isspace((int)*tmp); --tmp) *tmp = 0;
+        /* A key followed only by whitespace has an empty value. Avoid
+         * stepping before the start of value when trimming that line. */
+        if (*value) {
+          tmp = value + strlen(value);
+          while (tmp > value && isspace((int)tmp[-1])) --tmp;
+          *tmp = 0;
+        }
         parse_var(name, value);
       }
     }
