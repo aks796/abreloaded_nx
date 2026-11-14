@@ -555,6 +555,14 @@ static void *oc_find_stack_window(size_t want, size_t *out_size) {
     if (a2 < sec_a + sec_l) {
       u64 v2 = ((sec_a + sec_l) - a2) & ~(MMAP_ARENA_ALIGN - 1);
       if (v2 > want) v2 = want;
+      /* Keep a contiguous stack-region tail for Switch 2 .so mappings. Those
+       * writable image pages use svcMapMemory, which rejects ASLR/heap-region
+       * destinations. Round up so both this window and its retained tail stay
+       * on the arena's 64 MB granularity. */
+      const u64 so_tail = (SO_REGION_BYTES + MMAP_ARENA_ALIGN - 1) &
+                          ~(MMAP_ARENA_ALIGN - 1);
+      if (v2 > so_tail) v2 -= so_tail;
+      else v2 = 0;
       if (v2) { g_oc_win2 = (void *)a2; g_oc_win2_sz = v2; }
     }
   }
@@ -661,10 +669,19 @@ void __libnx_initheap(void) {
 }
 
 static void check_syscalls(void) {
+#ifdef __SWITCH2__
+  /* kaiHEN's title policy intentionally withholds process-code syscalls.
+   * Executable mappings must go through its ldr:ro service (libkaihen). */
+  if (!envIsSyscallHinted(0x04) || !envIsSyscallHinted(0x05))
+    fatal_error("Switch 2 requires svcMapMemory/svcUnmapMemory.");
+  if (smGetServiceOverride(smEncodeName("ldr:ro")) == INVALID_HANDLE)
+    fatal_error("Switch 2 code mapping unavailable: launch through kaiHEN hbloader.");
+#else
   if (!envIsSyscallHinted(0x77)) fatal_error("svcMapProcessCodeMemory is unavailable.");
   if (!envIsSyscallHinted(0x78)) fatal_error("svcUnmapProcessCodeMemory is unavailable.");
   if (!envIsSyscallHinted(0x73)) fatal_error("svcSetProcessMemoryPermission is unavailable.");
   if (envGetOwnProcessHandle() == INVALID_HANDLE) fatal_error("Own process handle is unavailable.");
+#endif
 }
 
 void nx_join_split_assets(const char *dir);   /* nx_splitjoin.c */
@@ -861,6 +878,7 @@ static fn_v        Unity_nativeApplicationUnload;
  * mismatch leaves the binary untouched (different Unity build) with a loud log.
  * ------------------------------------------------------------------------- */
 static int nx_patch_libunity(uintptr_t ub) {
+  debugLogNote("[patch] checkpoint: enter nx_patch_libunity base=%p\n", (void *)ub);
   /* PvZ Fusion 3.6.1 (Unity 2022.3.62f1c1): tables live in nx_patch_abr.h.
    * VERIFY-FIRST like the original -- every {from} word must match before ANY
    * write; a fully pre-patched .so is accepted; any mismatch patches nothing. */
@@ -868,7 +886,10 @@ static int nx_patch_libunity(uintptr_t ub) {
   const int N = ABR_PATCH_WORDS_N;
   int stock = 0, patched = 0;
   for (int i = 0; i < N; i++) {
+    debugLogNote("[patch] checkpoint: read word %d/%d @+0x%x (%p)\n",
+                 i + 1, N, (unsigned)P[i].off, (void *)(ub + P[i].off));
     uint32_t cur = *(volatile uint32_t *)(ub + P[i].off);
+    debugLogNote("[patch] checkpoint: word %d read 0x%08x\n", i + 1, cur);
     if (cur == P[i].from) stock++;
     else if (cur == P[i].to) patched++;
     else {
@@ -883,10 +904,15 @@ static int nx_patch_libunity(uintptr_t ub) {
     debugPrintf("[patch] libunity PARTIALLY patched (%d/%d) -> SKIP (won't mix builds)\n", patched, N);
     return 0;
   } else {
-    for (int i = 0; i < N; i++)
+    for (int i = 0; i < N; i++) {
+      debugLogNote("[patch] checkpoint: write word %d/%d @+0x%x\n",
+                   i + 1, N, (unsigned)P[i].off);
       so_patch_code((void *)(ub + P[i].off), &P[i].to, sizeof P[i].to);
+      debugLogNote("[patch] checkpoint: write word %d complete\n", i + 1);
+    }
     debugPrintf("[patch] libunity region granularity 256MB->64MB patched (%d sites)\n", N);
   }
+  debugLogNote("[patch] checkpoint: fixed-word table complete stock=%d patched=%d\n", stock, patched);
   /* Optional branch forces (only when you have located them; see nx_patch_abr.h). */
   if (ABR_BRANCH_FORCES_N > 0) {
     const NxPatchWord *B = ABR_BRANCH_FORCES;
@@ -900,6 +926,7 @@ static int nx_patch_libunity(uintptr_t ub) {
     }
     debugPrintf("[patch] libunity branch forces applied (%d sites)\n", ABR_BRANCH_FORCES_N);
   }
+  debugLogNote("[patch] checkpoint: nx_patch_libunity complete\n");
   return 1;
 }
 
@@ -1228,27 +1255,34 @@ int main(int argc, char *argv[]) {
   (void)argc; (void)argv;
   socketInitializeDefault();
   debugPrintf("[boot] === abreloaded_nx " ABR_SRC_REV " start (region64mb build) ===\n");
+  debugLogFlush();  /* make the fresh-run marker survive an early title crash */
 
   /* Load config.txt. When the file is
    * missing, autogenerate a documented one with the defaults; when it holds
    * retired options (`portrait` among them now), rewrite it without them. */
   {
+    debugLogNote("[boot] checkpoint: before read_config(%s)\n", DATA_ROOT "/" CONFIG_NAME);
     int crc = read_config(DATA_ROOT "/" CONFIG_NAME);
+    debugLogNote("[boot] checkpoint: read_config returned %d (handheld_res=%d docked_res=%d)\n",
+                 crc, config.handheld_res, config.docked_res);
     if (crc != 0) {
-      write_config(DATA_ROOT "/" CONFIG_NAME);
-      debugPrintf("[boot] %s config.txt (handheld_res=%d docked_res=%d)\n",
+      int wrc = write_config(DATA_ROOT "/" CONFIG_NAME);
+      debugLogNote("[boot] checkpoint: write_config returned %d\n", wrc);
+      debugLogNote("[boot] %s config.txt (handheld_res=%d docked_res=%d)\n",
                   crc < 0 ? "created" : "rewrote",
                   config.handheld_res, config.docked_res);
     } else {
-      debugPrintf("[boot] config: handheld_res=%d docked_res=%d\n",
+      debugLogNote("[boot] config: handheld_res=%d docked_res=%d\n",
                   config.handheld_res, config.docked_res);
     }
   }
+  debugLogNote("[boot] checkpoint: config handling complete\n");
 
   /* Sweep Unity's case-sensitivity probe files: CASESENSITIVETEST<guid> strays
    * from older builds, plus the single hidden scratch the probe is redirected
    * to now (libc_shim.c casetest_redirect). */
   {
+    debugLogNote("[boot] checkpoint: before case-probe sweep\n");
     DIR *dd = opendir(DATA_ROOT);
     int swept = 0;
     if (dd) {
@@ -1264,6 +1298,7 @@ int main(int argc, char *argv[]) {
     }
     if (swept) debugPrintf("[boot] swept %d case-sensitivity probe file(s)\n", swept);
   }
+  debugLogNote("[boot] checkpoint: case-probe sweep complete\n");
 
   /* CWD fix (mirrors MMX enter_data_dir): title-override / hbloader leaves the
    * working dir at the .nro folder or the SD root, NOT the game dir. Unity &
@@ -1273,6 +1308,7 @@ int main(int argc, char *argv[]) {
    * relative read resolves under sdmc:/switch/zookeeper. (Absolute "sdmc:/..."
    * reads are unaffected.) */
   {
+    debugLogNote("[boot] checkpoint: before cwd change and asset probes\n");
     char cwd[256] = {0};
     getcwd(cwd, sizeof cwd);
     int rc = chdir(DATA_ROOT);
@@ -1302,6 +1338,7 @@ int main(int argc, char *argv[]) {
     debugPrintf("[boot] reachable(%s): data.unity3d=%d metadata=%d unity_app_guid=%d\n",
                 _packed ? "pack" : "rel, pre-mount", reach_assets, reach_meta, reach_guid);
   }
+  debugLogNote("[boot] checkpoint: cwd change and asset probes complete\n");
 
   /* Reuse Unity's extracted il2cpp tree when it is demonstrably complete.  The
    * old workaround deleted it unconditionally because read_fake could return a
@@ -1314,6 +1351,7 @@ int main(int argc, char *argv[]) {
    * require Unity's own unity.ver completion marker.  A partial/interrupted tree
    * is still removed so Unity gets a clean retry instead of mmaping corruption. */
   {
+    debugLogNote("[boot] checkpoint: before il2cpp cache validation\n");
     struct stat src_meta, dst_meta, src_res, dst_res, marker, tree, tmp;
     int have_src_meta = stat(DATA_ROOT "/assets/bin/Data/Managed/Metadata/global-metadata.dat", &src_meta) == 0;
     int have_dst_meta = stat(DATA_ROOT "/il2cpp/Metadata/global-metadata.dat", &dst_meta) == 0;
@@ -1342,9 +1380,12 @@ int main(int argc, char *argv[]) {
                   have_src_res ? (long long)src_res.st_size : -1ll);
     }
   }
+  debugLogNote("[boot] checkpoint: il2cpp cache validation complete\n");
 
+  debugLogNote("[boot] checkpoint: before syscall checks\n");
   check_syscalls();
-  debugPrintf("[boot] syscalls ok\n");
+  debugLogNote("[boot] syscalls ok\n");
+  debugLogNote("[boot] checkpoint: before memory-layout logging\n");
   {
     extern char *fake_heap_start, *fake_heap_end;
     debugPrintf("[boot] mem layout: newlib=%u MB, mmap arena=%u MB @ %p\n",
@@ -1360,6 +1401,8 @@ int main(int argc, char *argv[]) {
                   (unsigned)(g_oc_sysres >> 20), g_oc_hint_map, g_oc_alias_mb);
   }
 
+  debugLogNote("[boot] checkpoint: memory-layout logging complete\n");
+
   /* Overcommit feasibility probe. Proper PROT_NONE overcommit on Switch needs a
    * physical-backing primitive (svcMapMemory in the stack region, or
    * svcMapPhysicalMemory in the alias region) plus a region large enough to hold
@@ -1367,6 +1410,7 @@ int main(int argc, char *argv[]) {
    * stack region is ~1GB). Log the region sizes + which mapping svc are granted so
    * we can size/choose the real overcommit (or rule it out) from real numbers. */
   {
+    debugLogNote("[boot] checkpoint: before memory-region probes\n");
     struct { const char *nm; int a, s; } R[] = {
       { "alias", InfoType_AliasRegionAddress, InfoType_AliasRegionSize },
       { "heap",  InfoType_HeapRegionAddress,  InfoType_HeapRegionSize  },
@@ -1390,6 +1434,7 @@ int main(int argc, char *argv[]) {
                 envIsSyscallHinted(0x2c), envIsSyscallHinted(0x2d),
                 envIsSyscallHinted(0x24), envIsSyscallHinted(0x25));
   }
+  debugLogNote("[boot] checkpoint: memory-region probes complete\n");
 
   /* Decisive probe: does svcMapMemory accept a dst in the (unmapped upper) HEAP
    * region? The stack region works but is only ~2GB (~8 regions). The heap region
@@ -1398,6 +1443,7 @@ int main(int argc, char *argv[]) {
    * (~28 regions) without any libunity patching. Pure diagnostic: map 1 page,
    * verify the sentinel reads back, unmap. */
   {
+    debugLogNote("[boot] checkpoint: before heap svcMapMemory probe\n");
     u64 hbase = 0, hsize = 0;
     svcGetInfo(&hbase, InfoType_HeapRegionAddress, CUR_PROCESS_HANDLE, 0);
     svcGetInfo(&hsize, InfoType_HeapRegionSize,    CUR_PROCESS_HANDLE, 0);
@@ -1434,6 +1480,8 @@ int main(int argc, char *argv[]) {
     }
   }
 
+  debugLogNote("[boot] checkpoint: heap svcMapMemory probe complete\n");
+
   /* Arm the stack-region overcommit arena. The boot probe confirmed svcMapMemory
    * aliases heap pages into the stack region; Unity reserves ~2.8GB of PROT_NONE
    * pools but commits only ~80MB. Reserve a 1280MB stack-region window (cheap
@@ -1441,6 +1489,7 @@ int main(int argc, char *argv[]) {
    * holds Unity's big reservations there and aliases pool pages in on mprotect.
    * Any failure leaves OC disabled and the engine runs on the heap-backed arena. */
   {
+    debugLogNote("[boot] checkpoint: before overcommit arena setup\n");
     void *pool = NULL;
     size_t winsz = 0;
     void *win = oc_find_stack_window(OC_WINDOW_BYTES, &winsz);
@@ -1490,6 +1539,7 @@ int main(int argc, char *argv[]) {
                   win, (unsigned)(winsz >> 20), (void *)rv);
     }
   }
+  debugLogNote("[boot] checkpoint: overcommit arena setup complete\n");
 
   /* fbstub45 PORTRAIT: ZOOKEEPER is a portrait game. Report a portrait surface
    * (W<H) everywhere Unity reads dimensions so the engine renders upright. The
@@ -1499,9 +1549,11 @@ int main(int argc, char *argv[]) {
   if (appletGetOperationMode() == AppletOperationMode_Console) { screen_width = 1080; screen_height = 1920; }
   else                                                         { screen_width = 720;  screen_height = 1280; }
 
+  debugLogNote("[boot] checkpoint: before SDL_Init\n");
   SDL_SetMainReady();
   if (SDL_Init(SDL_INIT_AUDIO | SDL_INIT_GAMECONTROLLER) < 0)
     debugPrintf("SDL_Init failed: %s\n", SDL_GetError());
+  debugLogNote("[boot] checkpoint: SDL_Init complete\n");
 
   /* Reassemble any *.splitN assets before the preflight check. Unity does
    * this in Java on a phone (see nx_splitjoin.c); we have no Java, so we
@@ -1592,16 +1644,25 @@ int main(int argc, char *argv[]) {
 
   nx_dump_dir(DATA_ROOT "/il2cpp", "before-boot");
   nx_dump_dir(DATA_ROOT "/il2cpp/Metadata", "before-boot");
+  debugLogNote("[boot] checkpoint: before check_data\n");
   check_data(_pack_mounted);
+  debugLogNote("[boot] checkpoint: check_data complete\n");
 
   /* load the three modules; libil2cpp resolves its engine calls against libunity
    * module-to-module during relocation. */
+  debugLogNote("[boot] checkpoint: before module loading\n");
   debugPrintf("[boot] loading modules...\n");
+  debugLogNote("[boot] checkpoint: before libmain load\n");
   if (load_module(&main_mod,   LIB_MAIN)   < 0) fatal_error("Could not load %s", LIB_MAIN);
+  debugLogNote("[boot] checkpoint: libmain load complete\n");
   debugPrintf("[boot] loaded libmain   @ virtbase %p\n", (void *)main_mod.load_virtbase);
+  debugLogNote("[boot] checkpoint: before libunity load\n");
   if (load_module(&unity_mod,  LIB_UNITY)  < 0) fatal_error("Could not load %s", LIB_UNITY);
+  debugLogNote("[boot] checkpoint: libunity load complete\n");
   debugPrintf("[boot] loaded libunity  @ virtbase %p\n", (void *)unity_mod.load_virtbase);
+  debugLogNote("[boot] checkpoint: before libil2cpp load\n");
   if (load_module(&il2cpp_mod, LIB_IL2CPP) < 0) fatal_error("Could not load %s", LIB_IL2CPP);
+  debugLogNote("[boot] checkpoint: libil2cpp load complete\n");
   debugPrintf("[boot] loaded libil2cpp @ virtbase %p\n", (void *)il2cpp_mod.load_virtbase);
 
 
@@ -1609,7 +1670,9 @@ int main(int argc, char *argv[]) {
   /* hand the il2cpp exec base to the GC stop-the-world bridge in libc_shim.c so
    * our pthread_kill can ack the Boehm GC's (undeliverable) suspend/restart
    * signals via its semaphore at il2cpp+0x25936c0. */
+  debugLogNote("[boot] checkpoint: before GC bridge base setup\n");
   g_il2cpp_base = (uintptr_t)il2cpp_mod.load_virtbase;
+  debugLogNote("[boot] checkpoint: GC bridge base setup complete\n");
 
   /* Firebase native libs are intentionally NOT loaded. The first scene's
    * FirebaseManager only advances when the managed dependency check reports
@@ -1620,9 +1683,14 @@ int main(int argc, char *argv[]) {
    * via dlsym_fake) that make the check resolve to Available. The 4 .so files can
    * be deleted from sdmc:/switch/zookeeper/. Firebase is cosmetic here (RemoteConfig
    * banner/news textures), so stubbing it costs only those images. */
+  debugLogNote("[boot] checkpoint: before libmain finalize\n");
   so_finalize(&main_mod);   so_flush_caches(&main_mod);
+  debugLogNote("[boot] checkpoint: libmain finalize complete\n");
   so_finalize(&unity_mod);  so_flush_caches(&unity_mod);
+  debugLogNote("[boot] checkpoint: libunity finalize complete\n");
   so_finalize(&il2cpp_mod); so_flush_caches(&il2cpp_mod);
+  debugLogNote("[boot] checkpoint: libil2cpp finalize complete\n");
+  debugLogNote("[boot] checkpoint: before libunity patching\n");
   debugPrintf("[boot] modules finalized + flushed (canary-patch disabled)\n");
 
   /* Patch libunity AFTER finalize/flush -- the same point every other libunity
@@ -1632,6 +1700,7 @@ int main(int argc, char *argv[]) {
    * load_module faulted at boot (fbstub94: stock .so on SD, PC in the patch
    * path before finalize). */
   nx_patch_libunity((uintptr_t)unity_mod.load_virtbase);
+  debugLogNote("[boot] checkpoint: libunity patching complete\n");
 
   /* Force FMOD to use its native OpenSL ES output instead of Unity's Java
    * AudioTrack driver.
@@ -1742,12 +1811,18 @@ int main(int argc, char *argv[]) {
   /* The main thread runs init_array + the engine lifecycle; give it its own
    * stable bionic TLS for the stack-protector guard (tpidr_el0+0x28). */
   static uint8_t main_tls[BIONIC_TLS_SIZE] __attribute__((aligned(16)));
+  debugLogNote("[boot] checkpoint: before installing main TLS\n");
   install_bionic_tls(main_tls);
+  debugLogNote("[boot] checkpoint: main TLS installed\n");
 
+  debugLogNote("[boot] checkpoint: before init arrays\n");
   debugPrintf("[boot] running init arrays...\n");
   so_execute_init_array(&main_mod);
+  debugLogNote("[boot] checkpoint: libmain init array complete\n");
   so_execute_init_array(&unity_mod);
+  debugLogNote("[boot] checkpoint: libunity init array complete\n");
   so_execute_init_array(&il2cpp_mod);
+  debugLogNote("[boot] checkpoint: libil2cpp init array complete\n");
   so_free_temp(&main_mod); so_free_temp(&unity_mod); so_free_temp(&il2cpp_mod);
   debugPrintf("[boot] init arrays done\n");
 
@@ -1951,7 +2026,9 @@ int main(int argc, char *argv[]) {
   Unity_initJni(fake_env, fake_unityplayer_thiz, fake_context_obj);
   debugPrintf("[boot] initJni returned; nativeRecreateGfxState...\n");
   Unity_nativeRecreateGfxState(fake_env, fake_unityplayer_thiz, 0, fake_surface_obj);
-  nx_gpu_probe();   /* hardware-vs-software ASTC, one line in debug.log */
+#ifndef __SWITCH2__
+  nx_gpu_probe();   /* Switch 1 Nouveau hardware-vs-software ASTC diagnostic */
+#endif
   debugPrintf("[boot] gfx state created; sendSurfaceChanged...\n");
   Unity_nativeSendSurfaceChanged(fake_env, fake_unityplayer_thiz);
   debugPrintf("[boot] surface change sent; resuming + focusing player loop\n");
