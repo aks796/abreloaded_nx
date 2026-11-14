@@ -2,9 +2,9 @@
 
 <img src="reloaded.jpg" alt="abreloaded_nx" width="160">
 
-# abreloaded_nx
+# abreloaded_nx2
 
-**Angry Birds Reloaded on Nintendo Switch**
+**Angry Birds Reloaded on Nintendo Switch and Switch 2**
 
 An unofficial Nintendo Switch wrapper for the Android version of
 **Angry Birds Reloaded**.
@@ -19,7 +19,7 @@ An unofficial Nintendo Switch wrapper for the Android version of
 
 ## About
 
-`abreloaded_nx` is a native wrapper that runs the ARM64 Android build of
+`abreloaded_nx2` is a native wrapper that runs the ARM64 Android build of
 **Angry Birds Reloaded** on Nintendo Switch. It recreates the Android and JNI
 services expected by the game under Horizon OS.
 
@@ -84,8 +84,8 @@ sudo apt install git make curl
 Clone this repository and install the common portlibs used by both targets:
 
 ```bash
-git clone https://github.com/aks796/abreloaded_nx.git
-cd abreloaded_nx
+git clone https://github.com/githubuser77777/abreloaded_nx2.git
+cd abreloaded_nx2
 sudo dkp-pacman -S switch-dev switch-sdl2 switch-zlib switch-libpng
 ```
 
@@ -102,7 +102,7 @@ and installs its files under `DEVKITPRO`:
 git clone https://github.com/ouncebrew/ounce-devkit.git
 cd ounce-devkit
 sh install.sh
-cd ../abreloaded_nx
+cd ../abreloaded_nx2
 ```
 
 To install a particular ounce-devkit release, pass its version to the installer
@@ -111,7 +111,7 @@ To install a particular ounce-devkit release, pass its version to the installer
 
 ### 3. Build for Nintendo Switch
 
-From the `abreloaded_nx` repository root, build the default Switch 1 NRO:
+From the `abreloaded_nx2` repository root, build the default Switch 1 NRO:
 
 ```bash
 make -j"$(nproc)"
