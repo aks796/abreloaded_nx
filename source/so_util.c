@@ -16,6 +16,9 @@
 #include <string.h>
 #include <malloc.h>
 #include <elf.h>
+#ifdef __SWITCH2__
+#include <kaihen.h>
+#endif
 
 #include "config.h"
 #include "so_util.h"
@@ -33,6 +36,152 @@
 #define DT_ANDROID_RELRENT 0x6fffe003
 
 static so_module *so_list = NULL;
+
+#ifdef __SWITCH2__
+/* libkaihen implements these libounce JIT hooks using kaiHEN's ldr:ro
+ * service. Process code SVCs are not part of the game role's capability set. */
+extern Result __nx_jit_map_code(void* rx_addr, void* src_addr, size_t size) __attribute__((weak));
+extern Result __nx_jit_unmap_code(void* rx_addr, void* src_addr, size_t size) __attribute__((weak));
+extern Result __nx_jit_map_alias(void* rx_addr, size_t size) __attribute__((weak));
+static uint8_t *nx2_page_map(const so_module *mod);
+
+typedef struct {
+  uintptr_t rx;
+  size_t size;
+} nx2_patch_alias;
+static nx2_patch_alias g_nx2_patch_aliases[32];
+static size_t g_nx2_patch_alias_count;
+
+/* Map one persistent RO-owned writable alias for the executable run, then
+ * publish the modified bytes at their offset. The NRO cannot call
+ * svcMapProcessMemory directly under kaiHEN's title syscall policy. */
+static int nx2_publish_code(so_module *mod, uintptr_t dst, const void *src, size_t len) {
+  const uintptr_t base = (uintptr_t)mod->load_virtbase;
+  if (!__nx_jit_map_alias || !src || !len || dst < base ||
+      dst - base > mod->load_size ||
+      len > mod->load_size - (dst - base))
+    return -1;
+
+  uint8_t *is_x_page = nx2_page_map(mod);
+  if (!is_x_page) return -1;
+  const size_t pages = mod->load_size / 0x1000;
+  const size_t first_target = (dst - base) / 0x1000;
+  const size_t last_target = (dst - base + len - 1) / 0x1000;
+  if (first_target >= pages || last_target >= pages || !is_x_page[first_target] ||
+      !is_x_page[last_target]) {
+    free(is_x_page);
+    return -1;
+  }
+  size_t first = first_target, end = first_target + 1;
+  while (first && is_x_page[first - 1]) first--;
+  while (end < pages && is_x_page[end]) end++;
+  free(is_x_page);
+
+  const uintptr_t run_rx = (uintptr_t)mod->load_virtbase + first * 0x1000;
+  const size_t run_size = (end - first) * 0x1000;
+  int have_alias = 0;
+  for (size_t i = 0; i < g_nx2_patch_alias_count; i++) {
+    if (g_nx2_patch_aliases[i].rx == run_rx && g_nx2_patch_aliases[i].size == run_size) {
+      have_alias = 1;
+      break;
+    }
+  }
+  if (!have_alias) {
+    if (g_nx2_patch_alias_count >= sizeof(g_nx2_patch_aliases) / sizeof(g_nx2_patch_aliases[0]))
+      return -1;
+    const Result map_rc = __nx_jit_map_alias((void *)run_rx, run_size);
+    if (R_FAILED(map_rc)) {
+      debugLogNote("[patch] ldr:ro MapJitAlias failed rx=%p size=0x%zx rc=%08x\n",
+                   (void *)run_rx, run_size, map_rc);
+      return -1;
+    }
+    g_nx2_patch_aliases[g_nx2_patch_alias_count++] = (nx2_patch_alias){run_rx, run_size};
+  }
+
+  Service ro;
+  Result rc = kaihenGetRoSession(&ro);
+  if (R_FAILED(rc)) return -1;
+  const size_t offset = (dst - run_rx);
+  const struct {
+    u64 pid_placeholder;
+    u64 destination;
+    u64 offset;
+    u64 size;
+  } in = {0, run_rx, offset, len};
+  rc = serviceDispatchIn(&ro, KaihenRoCommand_PublishJitAlias, in,
+      .buffer_attrs = {SfBufferAttr_HipcMapAlias | SfBufferAttr_In},
+      .buffers = {{src, len}},
+      .in_send_pid = true);
+  if (R_FAILED(rc)) {
+    debugLogNote("[patch] ldr:ro PublishJitAlias failed rx=%p offset=0x%zx size=0x%zx rc=%08x\n",
+                 (void *)run_rx, offset, len, rc);
+    return -1;
+  }
+  armICacheInvalidate((void *)dst, len);
+  return 0;
+}
+
+static uint8_t *nx2_page_map(const so_module *mod) {
+  const size_t pages = mod->load_size / 0x1000;
+  uint8_t *is_x_page = calloc(pages, 1);
+  if (!is_x_page) return NULL;
+  for (int i = 0; i < mod->phnum; i++) {
+    const Elf64_Phdr *p = &mod->phdr[i];
+    if (p->p_type != PT_LOAD || !(p->p_flags & PF_X)) continue;
+    const size_t first = p->p_vaddr / 0x1000;
+    const size_t last = ALIGN_MEM(p->p_vaddr + p->p_memsz, 0x1000) / 0x1000;
+    for (size_t pg = first; pg < last && pg < pages; pg++) is_x_page[pg] = 1;
+  }
+  return is_x_page;
+}
+
+static Result nx2_map_image(so_module *mod, const uint8_t *is_x_page) {
+  if (!__nx_jit_map_code || !__nx_jit_unmap_code)
+    return MAKERESULT(Module_Libnx, LibnxError_JitUnavailable);
+  const size_t pages = mod->load_size / 0x1000;
+  size_t pg = 0;
+  while (pg < pages) {
+    const uint8_t executable = is_x_page[pg];
+    size_t end = pg + 1;
+    while (end < pages && is_x_page[end] == executable) end++;
+    void *dst = (uint8_t *)mod->load_virtbase + pg * 0x1000;
+    void *src = (uint8_t *)mod->load_base + pg * 0x1000;
+    const size_t size = (end - pg) * 0x1000;
+    const Result rc = executable
+      ? __nx_jit_map_code(dst, src, size)
+      : svcMapMemory(dst, src, size);
+    if (R_FAILED(rc)) {
+      debugPrintf("[so] %s: %s map failed dst=%p src=%p size=0x%zx rc=%08x\n",
+                  mod->name, executable ? "ldr:ro RX" : "svcMapMemory RW",
+                  dst, src, size, rc);
+      return rc;
+    }
+    pg = end;
+  }
+  return 0;
+}
+
+static Result nx2_unmap_image(so_module *mod, const uint8_t *is_x_page) {
+  if (!__nx_jit_unmap_code)
+    return MAKERESULT(Module_Libnx, LibnxError_JitUnavailable);
+  const size_t pages = mod->load_size / 0x1000;
+  size_t pg = 0;
+  while (pg < pages) {
+    const uint8_t executable = is_x_page[pg];
+    size_t end = pg + 1;
+    while (end < pages && is_x_page[end] == executable) end++;
+    void *dst = (uint8_t *)mod->load_virtbase + pg * 0x1000;
+    void *src = (uint8_t *)mod->load_base + pg * 0x1000;
+    const size_t size = (end - pg) * 0x1000;
+    const Result rc = executable
+      ? __nx_jit_unmap_code(dst, src, size)
+      : svcUnmapMemory(dst, src, size);
+    if (R_FAILED(rc)) return rc;
+    pg = end;
+  }
+  return 0;
+}
+#endif
 
 void hook_arm64(uintptr_t addr, uintptr_t dst) {
   if (addr == 0)
@@ -56,15 +205,11 @@ void so_free_temp(so_module *mod) {
 void so_finalize(so_module *mod) {
   Result rc = 0;
 
-  // map the entire thing as code memory
-  rc = svcMapProcessCodeMemory(envGetOwnProcessHandle(), (u64)mod->load_virtbase, (u64)mod->load_base, mod->load_size);
-  if (R_FAILED(rc)) fatal_error("Error: svcMapProcessCodeMemory failed:\n%08x", rc);
-
   // the kernel never allows W -> X transitions on code memory, so the RX
   // segments must be set first, straight from the freshly-mapped state;
   // everything else (data segments AND the alignment gaps lld leaves
-  // between segments) becomes RW afterwards. build a page map to emit
-  // each permission exactly once per page.
+  // between segments) becomes RW afterwards. Build one page map for mapping
+  // and (on Switch 1) permission changes.
   const size_t num_pages = mod->load_size / 0x1000;
   uint8_t *is_x_page = calloc(num_pages, 1);
   if (!is_x_page) fatal_error("Error: out of memory in so_finalize");
@@ -79,7 +224,18 @@ void so_finalize(so_module *mod) {
       is_x_page[pg] = 1;
   }
 
+#ifdef __SWITCH2__
+  // The game-role policy denies process-code syscalls to the app, so kaiHEN's
+  // ldr:ro service maps executable runs and svcMapMemory maps writable runs.
+  rc = nx2_map_image(mod, is_x_page);
+  if (R_FAILED(rc)) fatal_error("Error: Switch 2 image mapping failed for %s:\n%08x", mod->name, rc);
+#else
+  rc = svcMapProcessCodeMemory(envGetOwnProcessHandle(), (u64)mod->load_virtbase, (u64)mod->load_base, mod->load_size);
+  if (R_FAILED(rc)) fatal_error("Error: svcMapProcessCodeMemory failed:\n%08x", rc);
+#endif
+
   // pass 0 sets the executable runs to RX, pass 1 sets the rest to RW
+#ifndef __SWITCH2__
   for (int want_x = 1; want_x >= 0; want_x--) {
     size_t pg = 0;
     while (pg < num_pages) {
@@ -97,14 +253,12 @@ void so_finalize(so_module *mod) {
       pg = run_end;
     }
   }
+#endif
 
   free(is_x_page);
 
-  // svcMapProcessCodeMemory donates the source pages (load_base) to the code
-  // mapping; afterwards load_base is in CodeMemory state and faults on access --
-  // the image is readable only via load_virtbase. mod->syms/dynstrtab were set to
-  // load_base for pre-finalize import resolution (when load_virtbase isn't mapped
-  // yet). Rebase them to load_virtbase now so post-finalize lookups (dlsym ->
+  // The source pages are mapped into the image at load_virtbase; rebase symbol
+  // tables that were used during pre-finalize relocation so post-finalize lookups (dlsym ->
   // so_lookup_export, e.g. libunity resolving il2cpp_init) read the live mapped
   // .dynsym/.dynstr instead of faulting on the donated source range.
   const uintptr_t delta = (uintptr_t)mod->load_virtbase - (uintptr_t)mod->load_base;
@@ -178,9 +332,23 @@ int so_load(so_module *mod, const char *filename, void *base, size_t max_size) {
 
   // reserve virtual memory space for the entire LOAD zone
   virtmemLock();
+#ifdef __SWITCH2__
+  /* svcMapMemory only accepts destinations in the stack region. Keep the
+   * whole module there so its writable pages can be mapped alongside the RX
+   * pages that kaiHEN maps through ldr:ro. */
+  mod->load_virtbase = virtmemFindStack(mod->load_size, 0x1000);
+#else
   mod->load_virtbase = virtmemFindCodeMemory(mod->load_size, 0x1000);
-  mod->load_memrv = virtmemAddReservation(mod->load_virtbase, mod->load_size);
+#endif
+  if (mod->load_virtbase)
+    mod->load_memrv = virtmemAddReservation(mod->load_virtbase, mod->load_size);
   virtmemUnlock();
+  if (!mod->load_virtbase || !mod->load_memrv) {
+    debugPrintf("so_load: %s could not reserve %zu bytes of virtual memory\n",
+                filename, mod->load_size);
+    res = -5;
+    goto err_free_so;
+  }
 
   // copy segments to where they belong, then fix up the runtime phdrs to
   // point into the virtual address space
@@ -516,7 +684,8 @@ int so_unload(so_module *mod) {
     so_free_temp(mod);
   }
 
-  // remap everything as RW
+  // Remap the Switch 1 executable regions as RW before unmapping the image.
+#ifndef __SWITCH2__
   for (int i = 0; i < mod->phnum; i++) {
     const Elf64_Phdr *p = &mod->phdr[i];
     if (p->p_type != PT_LOAD || !(p->p_flags & PF_X))
@@ -527,6 +696,13 @@ int so_unload(so_module *mod) {
   }
   // unmap everything
   svcUnmapProcessCodeMemory(envGetOwnProcessHandle(), (u64)mod->load_virtbase, (u64)mod->load_base, mod->load_size);
+#else
+  uint8_t *is_x_page = nx2_page_map(mod);
+  if (!is_x_page) fatal_error("Error: out of memory rebuilding Switch 2 page map");
+  const Result unmap_rc = nx2_unmap_image(mod, is_x_page);
+  free(is_x_page);
+  if (R_FAILED(unmap_rc)) fatal_error("Error: Switch 2 ldr:ro image unmap failed:\n%08x", unmap_rc);
+#endif
 
   // release virtual address range
   virtmemLock();
@@ -652,6 +828,18 @@ void so_patch_stack_canaries(so_module *mod) {
 // unmap, and flush caches. Returns 0 on success. Used to hook/replace specific
 // il2cpp methods that gate boot (no source recompilation available).
 int so_patch_code(void *dst, const void *src, size_t len) {
+#ifdef __SWITCH2__
+  so_module *mod = so_find_module_by_addr(dst);
+  if (!mod) {
+    debugLogNote("[patch] no owning module for code address %p\n", dst);
+    return -1;
+  }
+  const int rc = nx2_publish_code(mod, (uintptr_t)dst, src, len);
+  if (rc != 0) return rc;
+  armDCacheFlush(dst, len);
+  debugPrintf("[patch] ldr:ro published %p (%zu bytes)\n", dst, len);
+  return 0;
+#else
   uintptr_t start = (uintptr_t)dst & ~0xFFFull;
   size_t maplen = ((((uintptr_t)dst + len) - start) + 0xFFF) & ~0xFFFull;
   size_t off = (uintptr_t)dst - start;
@@ -674,4 +862,5 @@ int so_patch_code(void *dst, const void *src, size_t len) {
   armICacheInvalidate(dst, len);
   debugPrintf("[patch] ok %p (%zu bytes)\n", dst, len);
   return 0;
+#endif
 }
