@@ -51,33 +51,114 @@ A USB mouse can also move the cursor and click. Cursor settings are saved in
 
 ## Build
 
-### Requirements
+The project uses devkitPro's GNU toolchain and Makefile. Build commands below
+are run from a Linux shell. On Windows, use WSL2 with an Ubuntu distribution;
+run the commands inside Ubuntu rather than PowerShell. The Switch 2 build uses
+[ounce-devkit](https://github.com/ouncebrew/ounce-devkit), which adds libounce,
+OunceVK and libkaihen to a devkitPro installation. Its installer and Makefile
+integration are documented in the [ounce-devkit README](https://github.com/ouncebrew/ounce-devkit#install).
 
-* devkitPro
-* devkitA64 and libnx
-* Switch Mesa and libdrm_nouveau
-* Switch SDL2, zlib and libpng
-* GNU Make
+### 1. Install devkitPro
 
-Install the required devkitPro packages:
+Install devkitPro pacman by following the official
+[devkitPro setup instructions](https://devkitpro.org/wiki/devkitPro_pacman).
+Make sure `DEVKITPRO` is set in the shell. The default Linux location is
+`/opt/devkitpro`:
 
 ```bash
-pacman -S switch-dev switch-mesa switch-libdrm_nouveau switch-sdl2 switch-zlib switch-libpng
+export DEVKITPRO=/opt/devkitpro
 ```
 
-Compile the wrapper:
+If your devkitPro installation is in another directory, set `DEVKITPRO` to
+that path instead.
+
+On Ubuntu or WSL, install the host tools before continuing:
 
 ```bash
+sudo apt update
+sudo apt install git make curl
+```
+
+### 2. Install the project and portlibs
+
+Clone this repository and install the common portlibs used by both targets:
+
+```bash
+git clone https://github.com/aks796/abreloaded_nx.git
 cd abreloaded_nx
-make -j
+sudo dkp-pacman -S switch-dev switch-sdl2 switch-zlib switch-libpng
 ```
 
-For a clean rebuild:
+The default Switch 1 target also uses Mesa and Nouveau:
+
+```bash
+sudo dkp-pacman -S switch-mesa switch-libdrm_nouveau
+```
+
+For Switch 2, install ounce-devkit. The installer downloads a versioned release
+and installs its files under `DEVKITPRO`:
+
+```bash
+git clone https://github.com/ouncebrew/ounce-devkit.git
+cd ounce-devkit
+sh install.sh
+cd ../abreloaded_nx
+```
+
+To install a particular ounce-devkit release, pass its version to the installer
+(`sh install.sh VERSION`). See the ounce-devkit project for the
+[current release and installation details](https://github.com/ouncebrew/ounce-devkit).
+
+### 3. Build for Nintendo Switch
+
+From the `abreloaded_nx` repository root, build the default Switch 1 NRO:
+
+```bash
+make -j"$(nproc)"
+```
+
+The output is `abreloaded_nx.nro` in the repository root. To rebuild after
+changing target settings, clean first:
 
 ```bash
 make clean
-make -j
+make -j"$(nproc)"
 ```
+
+### 4. Build for Nintendo Switch 2
+
+From the same repository root, select the Switch 2 target explicitly:
+
+```bash
+make clean
+make SWITCH2=1 -j"$(nproc)"
+```
+
+This selects ounce-devkit's `switch2_rules`, Switch 2 compiler flags, OunceVK's
+EGL/OpenGL ES libraries, and libkaihen. The Switch 1 Mesa/Nouveau libraries are
+not used by this target. The output is also `abreloaded_nx.nro` in the repository
+root; copy it somewhere else before building another target if you need to keep
+both builds.
+
+The Switch 2 loader uses kaiHEN's `ldr:ro` service for executable image mapping
+and code patch publishing. Launch the NRO through kaiHEN's hbloader so the app
+receives that service override. A plain launch path without `ldr:ro` will fail
+at startup.
+
+### Build troubleshooting
+
+* `DEVKITPRO is not set`: export the path to your devkitPro installation in the
+  current shell, then rerun Make.
+* `switch2_rules: No such file or directory`: run `sh install.sh` from the
+  ounce-devkit checkout, and confirm it installed into the same `DEVKITPRO`
+  path used by this shell.
+* Missing SDL2, zlib or PNG headers/libraries: install `switch-sdl2`,
+  `switch-zlib` and `switch-libpng` with `dkp-pacman`.
+* Do not commit the generated `build/`, `.elf`, `.nro` or `.nacp` files. They are
+  build outputs, not source files.
+
+Include the devkitPro and ounce-devkit versions in build issue reports, along
+with the full compiler error and the target command you ran.
 
 ---
 
@@ -100,9 +181,11 @@ sd:/switch/abreloaded/
 The three libraries are found in `lib/arm64-v8a/` inside the APK. Copy the
 complete `assets/` directory without changing its layout.
 
-Launch the NRO through title override for full application memory: hold **R**
-while opening an installed game, then start `abreloaded_nx` from the Homebrew
-Menu.
+On Switch 1, launch through title override for full application memory: hold
+**R** while opening an installed game, then start `abreloaded_nx` from the
+Homebrew Menu. On Switch 2, launch from kaiHEN's hbloader as described in the
+[Switch 2 build instructions](#4-build-for-nintendo-switch-2) so the required
+`ldr:ro` service is supplied.
 
 ---
 
