@@ -86,7 +86,7 @@ Clone this repository and install the common portlibs used by both targets:
 ```bash
 git clone https://github.com/githubuser77777/abreloaded_nx2.git
 cd abreloaded_nx2
-sudo dkp-pacman -S switch-dev switch-sdl2 switch-zlib switch-libpng
+sudo pacman -S switch-dev switch-sdl2 switch-zlib switch-libpng
 ```
 
 The default Switch 1 target also uses Mesa and Nouveau:
