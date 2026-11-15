@@ -9,7 +9,7 @@
 An unofficial Nintendo Switch wrapper for the Android version of
 **Angry Birds Reloaded**.
 
-[![Switch](https://img.shields.io/badge/nintendo_switch_2-homebrew-red?style=for-the-badge)](#)
+[![Switch](https://img.shields.io/badge/nintendo_switch_2-homebrew-crimson?style=for-the-badge)](#)
 [![Version](https://img.shields.io/badge/Version-1.0.0-4C8BF5?style=for-the-badge)](#)
 [![Unity](https://img.shields.io/badge/Unity-2022.3.7f1-222C37?style=for-the-badge&logo=unity&logoColor=white)](#)
 
