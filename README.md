@@ -92,7 +92,7 @@ sudo pacman -S switch-dev switch-sdl2 switch-zlib switch-libpng
 The default Switch 1 target also uses Mesa and Nouveau:
 
 ```bash
-sudo dkp-pacman -S switch-mesa switch-libdrm_nouveau
+sudo pacman -S switch-mesa switch-libdrm_nouveau
 ```
 
 For Switch 2, install ounce-devkit. The installer downloads a versioned release
