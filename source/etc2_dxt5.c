@@ -20,6 +20,20 @@
 
 #include "etc2_dxt5.h"
 
+#ifdef __SWITCH2__
+
+/* OunceVK's GLES implementation accepts ETC2 natively. The Switch 1
+ * Mesa-private decoder is unavailable and unnecessary on Switch 2. */
+uint8_t *abr_etc2_rgba8_to_dxt5(const void *src, size_t src_size,
+                                unsigned width, unsigned height,
+                                int srgb, size_t *dst_size) {
+  (void)src; (void)src_size; (void)width; (void)height; (void)srgb;
+  if (dst_size) *dst_size = 0;
+  return NULL;
+}
+
+#else
+
 #include <stdbool.h>
 #include <stdlib.h>
 
@@ -90,3 +104,5 @@ uint8_t *abr_etc2_rgba8_to_dxt5(const void *src_void, size_t src_size,
   if (dst_size) *dst_size = out_bytes;
   return out;
 }
+
+#endif /* __SWITCH2__ */
