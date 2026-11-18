@@ -212,10 +212,10 @@
 #define DATA_ROOT   "sdmc:/switch/" GAME_FOLDER
 #endif
 
-// flip to 1 (and rebuild) to get file logging (debug.log) for on-hardware debugging
+// Flip to 1 and rebuild to get file logging (debug.log) for on-hardware debugging.
 /* File logging.
  *
- *   1 = ON  [shipped]. debug.log is written normally: boot trace, per-frame
+ *   1 = ON. debug.log is written normally: boot trace, per-frame
  *           diagnostics, [gc]/[mem] notes and the [xd] crash dump.
  *
  *   0 = ABSOLUTE SILENCE. debug.log is never created -- not by a crash, not by
@@ -224,10 +224,8 @@
  *
  * Note that 0 does NOT disable the watchdog thread: it is also the escape hatch
  * that undoes a wedged GC stop-the-world (round 101), so it always runs. */
-#define DEBUG_LOG 1   /* ON while this port is being brought up. Fruit Ninja shipped
-                       * 0 because it was finished; a port that has never booted must
-                       * log, and 0 means debug.log is NEVER created -- not even by a
-                       * crash. Flip to 0 only once the game runs. */
+#define DEBUG_LOG 0   /* Normal-play build: no log formatting or SD-card writes.
+                       * Set to 1 temporarily when collecting a diagnostic log. */
 
 /* Keep the audio timeline tied to visible progress. Unity performs scene and
  * cutscene setup inside nativeRender(); on Switch that call can block for
@@ -364,11 +362,10 @@
  * Set to 0 for absolute silence (DEBUG_LOG 0 already suppresses the output). */
 #define ABR_JNI_LOUD 1
 
-/* Poison freed newlib blocks with 0xDE (no quarantine, nothing retained).
- * Makes use-after-free deterministic instead of layout-dependent -- see the
- * comment in nx_alloc.c's nx_free_inner. Costs one memset per free; set to 0 to
- * restore the previous behaviour exactly. */
-#define ABR_POISON_FREE 1
+/* Diagnostic only: poison freed newlib blocks with 0xDE to expose stale reads.
+ * This adds a memset to every free and can cause frame hitches during asset and
+ * garbage-collection cleanup. Keep disabled for normal play. */
+#define ABR_POISON_FREE 0
 
 
 /* Diagnostic ONLY: call il2cpp_gc_disable() after init so no collection ever
