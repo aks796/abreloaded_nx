@@ -1,0 +1,72 @@
+name: Build Switch 2 NRO
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: devkitpro/devkita64:latest
+      options: --user root
+    env:
+      DEVKITPRO: /opt/devkitpro
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install Switch 2 toolchain and portlibs
+        shell: bash
+        run: |
+          dkp-pacman -Sy --needed --noconfirm switch-sdl2 switch-libpng switch-zlib
+          git clone --depth 1 https://github.com/ouncebrew/ounce-devkit.git \
+            "$RUNNER_TEMP/ounce-devkit"
+          sh "$RUNNER_TEMP/ounce-devkit/install.sh" 20261114
+
+      - name: Build NRO
+        shell: bash
+        run: |
+          mkdir -p dist
+          make clean
+          if [[ "$GITHUB_REF_TYPE" == "tag" && "$GITHUB_REF_NAME" == v* ]]; then
+            version="${GITHUB_REF_NAME#v}"
+            make SWITCH2=1 APP_VERSION="$version" -j"$(nproc)"
+            cp abreloaded_nx.nro "dist/abreloaded_nx-${GITHUB_REF_NAME}.nro"
+          else
+            make SWITCH2=1 -j"$(nproc)"
+          fi
+          cp abreloaded_nx.nro dist/
+
+      - name: Upload NRO artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: abreloaded_nx-${{ github.sha }}
+          path: dist/*.nro
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download built NRO
+        uses: actions/download-artifact@v4
+        with:
+          name: abreloaded_nx-${{ github.sha }}
+          path: release-assets
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Angry Birds Reloaded ${{ github.ref_name }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: release-assets/abreloaded_nx-${{ github.ref_name }}.nro
