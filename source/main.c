@@ -529,6 +529,8 @@ static void *oc_find_stack_window(size_t want, size_t *out_size) {
   svcGetInfo(&ssize, InfoType_StackRegionSize,    CUR_PROCESS_HANDLE, 0);
   if (!sbase || !ssize) return NULL;
   u64 end = sbase + ssize, a = sbase, best_a = 0, best_l = 0, sec_a = 0, sec_l = 0;
+  const u64 so_tail = (SO_REGION_BYTES + MMAP_ARENA_ALIGN - 1) &
+                      ~(MMAP_ARENA_ALIGN - 1);
   int holes = 0, mapped = 0;
   while (a < end) {
     MemoryInfo mi; u32 pi;
@@ -559,8 +561,6 @@ static void *oc_find_stack_window(size_t want, size_t *out_size) {
        * writable image pages use svcMapMemory, which rejects ASLR/heap-region
        * destinations. Round up so both this window and its retained tail stay
        * on the arena's 64 MB granularity. */
-      const u64 so_tail = (SO_REGION_BYTES + MMAP_ARENA_ALIGN - 1) &
-                          ~(MMAP_ARENA_ALIGN - 1);
       if (v2 > so_tail) v2 -= so_tail;
       else v2 = 0;
       if (v2) { g_oc_win2 = (void *)a2; g_oc_win2_sz = v2; }
@@ -571,6 +571,9 @@ static void *oc_find_stack_window(size_t want, size_t *out_size) {
   u64 avail = ((best_a + best_l) - aligned) & ~(MMAP_ARENA_ALIGN - 1);
   if (!avail) return NULL;
   if (avail > want) avail = want;
+  /* Keep a contiguous stack-region tail for Switch 2 shared-library mappings. */
+  if (avail <= so_tail) return NULL;
+  avail -= so_tail;
   *out_size = avail;
   return (void *)aligned;
 }

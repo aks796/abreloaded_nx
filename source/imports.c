@@ -883,10 +883,13 @@ static void gl_TexStorage2D_log(GLenum target, GLsizei levels, GLenum ifmt,
     w = (GLsizei)screen_width; h = (GLsizei)screen_height;
   }
   if (levels < 1) levels = 1;
-  /* Immutable ETC2 storage must use the same native format as the subsequent
-   * compressed-subimage bridge.  Otherwise Mesa allocates RGBA8 before any
-   * pixels arrive and the 4x memory blow-up has already happened. */
-  GLenum native_ifmt = abr_etc2_rgba_format(ifmt) ? abr_etc2_dxt5_format(ifmt) : ifmt;
+  /* Switch 1's ETC2 bridge uploads BC3, so immutable storage must use BC3 too.
+   * Switch 2 accepts ETC2 natively and must keep the original format. */
+  GLenum native_ifmt = ifmt;
+#ifndef __SWITCH2__
+  if (abr_etc2_rgba_format(ifmt))
+    native_ifmt = abr_etc2_dxt5_format(ifmt);
+#endif
   if (p) p(target, levels, native_ifmt, w, h);
   if (bound >= 2300 && bound <= 2400) {
     GLenum e = glGetError();
